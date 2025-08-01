@@ -29,13 +29,18 @@ MONITORED_USERS = {
 }
 
 # 環境変数から監視対象ユーザーを読み込む
-# 形式: "email1:folderid1,email2:folderid2"
+# 形式: "email1:folderid1,email2:folderid2" または "email1,email2" (フォルダIDは自動検索)
 users_config = os.getenv('MONITORED_USERS', '')
 if users_config:
     for user_config in users_config.split(','):
+        user_config = user_config.strip()
         if ':' in user_config:
-            email, folder_id = user_config.strip().split(':', 1)
+            # フォルダID指定あり
+            email, folder_id = user_config.split(':', 1)
             MONITORED_USERS[email] = folder_id
+        else:
+            # メールアドレスのみ（フォルダIDは後で自動検索）
+            MONITORED_USERS[user_config] = None
 
 # FastAPIアプリケーションのインスタンス化
 app = FastAPI(
@@ -245,6 +250,9 @@ async def renew_all_watches():
     Cloud Schedulerから定期的に呼び出されることを想定（24時間ごと）
     """
     print("Starting renewal process for all watch channels...")
+    print(f"MONITORED_USERS: {MONITORED_USERS}")
+    print(f"WEBHOOK_URL: {WEBHOOK_URL}")
+    
     if not WEBHOOK_URL:
         raise HTTPException(status_code=500, detail="WEBHOOK_URL environment variable not set")
         
@@ -261,9 +269,10 @@ async def renew_all_watches():
             creds = get_impersonated_credentials(user_email)
             drive_service = build('drive', 'v3', credentials=creds)
 
-            # --- 1. フォルダIDの確認 ---
+            # --- 1. フォルダIDの確認・取得 ---
             if not folder_id:
                 # フォルダIDが設定されていない場合は検索
+                print(f"Searching for 'Meet Recordings' folder for user: {user_email}")
                 q = "name='Meet Recordings' and mimeType='application/vnd.google-apps.folder'"
                 response = drive_service.files().list(q=q, spaces='drive', fields='files(id, name)').execute()
                 files = response.get('files', [])
@@ -271,6 +280,8 @@ async def renew_all_watches():
                     raise FileNotFoundError(f"'Meet Recordings' folder not found for user {user_email}")
                 folder_id = files[0].get('id')
                 print(f"Found 'Meet Recordings' folder with ID: {folder_id}")
+                # メモリ上のMONITORED_USERSを更新
+                MONITORED_USERS[user_email] = folder_id
             
             print(f"Using 'Meet Recordings' folder ID: {folder_id}")
 
