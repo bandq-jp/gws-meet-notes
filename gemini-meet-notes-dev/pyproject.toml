@@ -12,4 +12,5 @@ dependencies = [
     "google-auth-oauthlib",
     "google-cloud-firestore",
     "python-dotenv",
+    "pydantic"
 ]

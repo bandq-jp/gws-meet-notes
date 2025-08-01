@@ -1,119 +1,116 @@
 # main.py
-# FastAPIアプリケーションのメインファイル
+# FastAPIアプリケーションのメインファイル (Firestore不使用版)
 
+import base64
+import json
 import os
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
+from pydantic import BaseModel
 from google.oauth2 import service_account
 from googleapiclient.discovery import build, Resource
-from google.cloud import firestore
+from googleapiclient.errors import HttpError
 import google.auth
 
 # --- 設定値 -------------------------------------------------------------------
 
-# 環境変数から設定を読み込む
 GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
-SERVICE_ACCOUNT_FILE = os.getenv('SERVICE_ACCOUNT_FILE_PATH', 'path/to/your/service-account-key.json') # ローカルテスト用
-PUBSUB_TOPIC_NAME = os.getenv('PUBSUB_TOPIC_NAME') # projects/your-project-id/topics/your-topic-name
+PUBSUB_TOPIC_NAME = os.getenv('PUBSUB_TOPIC_NAME')
+# 環境変数から監視対象ユーザーをカンマ区切りで取得
+MONITORED_USERS = os.getenv('MONITORED_USERS', '')
 
-# Google APIのスコープ
 SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',
     'https://www.googleapis.com/auth/documents.readonly'
 ]
 
-# Firestoreクライアントの初期化
-db = firestore.Client()
-
-# FastAPIアプリケーションのインスタンス化
 app = FastAPI(
     title="Google Meet Minutes Processor",
-    description="Receives notifications from Google Drive and processes meeting minutes.",
+    description="Receives notifications from Google Drive via Pub/Sub and processes meeting minutes.",
 )
 
+# --- Pydanticモデル (変更なし) ---------------------------------------------
 
-# --- 認証ヘルパー -------------------------------------------------------------
+class PubSubMessage(BaseModel):
+    attributes: Dict[str, str]
+    data: str
+
+class PubSubRequest(BaseModel):
+    message: PubSubMessage
+    subscription: str
+
+# --- 認証ヘルパー (変更なし) -------------------------------------------------
 
 def get_impersonated_credentials(subject_email: str):
-    """
-    指定されたユーザーになりすますための認証情報を生成する。
-    Cloud Runのランタイムサービスアカウントを利用することを想定。
-    """
-    # Cloud Run環境では、`google.auth.default()`でランタイムのサービスアカウント認証情報を取得
+    """指定されたユーザーになりすますための認証情報を生成する。"""
     creds, _ = google.auth.default(scopes=SCOPES)
     return creds.with_subject(subject_email)
-
-
-# --- APIクライアント生成 (Dependency Injection) -----------------------------
-
-def get_drive_service(creds: Any = Depends(get_impersonated_credentials)) -> Resource:
-    """Google Drive APIクライアントを生成する"""
-    return build('drive', 'v3', credentials=creds)
-
-def get_docs_service(creds: Any = Depends(get_impersonated_credentials)) -> Resource:
-    """Google Docs APIクライアントを生成する"""
-    return build('docs', 'v1', credentials=creds)
-
 
 # --- エンドポイント ------------------------------------------------------------
 
 @app.post("/webhook", status_code=204)
-async def handle_drive_notification(request: Request):
+async def handle_drive_notification(body: PubSubRequest):
     """
-    Eventarc経由でPub/Subからの通知を受け取るエンドポイント (FR-01, FR-02, FR-06)
+    Pub/SubからのPush通知を受け取るエンドポイント。(この関数は変更なし)
     """
-    # --- 1. リクエストヘッダーから情報を取得 ---
-    # Google DriveからのPush Notificationは、ヘッダーに情報を含む
-    channel_state = request.headers.get("X-Goog-Resource-State")
-    file_id = request.headers.get("X-Goog-Resource-ID")
-    # watch登録時にtokenとして設定したユーザーメールアドレスを取得
-    user_email = request.headers.get("X-Goog-Channel-Token")
+    attributes = body.message.attributes
+    channel_state = attributes.get("X-Goog-Resource-State")
+    file_id = attributes.get("X-Goog-Resource-ID")
+    user_email = attributes.get("X-Goog-Channel-Token")
 
     print(f"Received notification for user: {user_email}, file: {file_id}, state: {channel_state}")
 
-    # ファイル追加・更新以外の通知や、必要なヘッダーがない場合は無視
+    if channel_state == "sync":
+        print("Sync message received. No action needed.")
+        return Response(status_code=204)
+        
     if channel_state not in ("add", "update") or not user_email or not file_id:
-        print("Ignoring notification due to irrelevant state or missing headers.")
+        print("Ignoring notification due to irrelevant state or missing attributes.")
         return Response(status_code=204)
 
     try:
-        # --- 2. ユーザーになりすましてAPIクライアントを取得 ---
         creds = get_impersonated_credentials(user_email)
         drive_service = build('drive', 'v3', credentials=creds)
-        docs_service = build('docs', 'v1', credentials=creds)
-
-        # --- 3. ファイルがGoogleドキュメントか確認 (FR-06) ---
+        
         file_metadata = drive_service.files().get(
-            fileId=file_id, fields='mimeType, name'
+            fileId=file_id, fields='mimeType, name, trashed'
         ).execute()
 
-        if file_metadata.get('mimeType') != 'application/vnd.google-g-suite.docs':
-            print(f"File '{file_metadata.get('name')}' is not a Google Doc. Skipping.")
+        if file_metadata.get('trashed'):
+             print(f"File '{file_metadata.get('name')}' is in trash. Skipping.")
+             return Response(status_code=204)
+
+        if file_metadata.get('mimeType') != 'application/vnd.google-apps.folder+vnd.google-apps.document':
+            print(f"File '{file_metadata.get('name')}' is not a Google Doc. MIME type: {file_metadata.get('mimeType')}. Skipping.")
             return Response(status_code=204)
 
         print(f"Processing Google Doc: '{file_metadata.get('name')}' for user {user_email}")
 
-        # --- 4. ドキュメントの内容を取得 (FR-02) ---
+        docs_service = build('docs', 'v1', credentials=creds)
         document = docs_service.documents().get(documentId=file_id).execute()
-        content_text = ""
-        for content in document.get('body', {}).get('content', []):
-            if 'paragraph' in content:
-                for element in content.get('paragraph', {}).get('elements', []):
-                    if 'textRun' in element:
-                        content_text += element.get('textRun', {}).get('content', '')
+        
+        content_text = "".join(
+            element.get('textRun', {}).get('content', '')
+            for content in document.get('body', {}).get('content', [])
+            if 'paragraph' in content
+            for element in content.get('paragraph', {}).get('elements', [])
+            if 'textRun' in element
+        )
 
-        # --- 5. 取得したテキストを処理 ---
-        # ここではログに出力するだけだが、実際にはここでDB保存や別APIへの送信などを行う
+        # --- ここで取得したテキストをログに出力 ---
         print("--- Document Content ---")
         print(content_text.strip())
         print("------------------------")
 
+    except HttpError as e:
+        print(f"ERROR: API HttpError for user {user_email}, file {file_id}. Reason: {e}")
+        if e.resp.status in [403, 404]:
+            return Response(status_code=204)
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        # エラーハンドリング (FR-05)
         print(f"ERROR: Failed to process notification for user {user_email}, file {file_id}. Reason: {e}")
-        # エラーを返すとPub/Subがリトライを試みる。永続的なエラーの場合は204を返すことも検討。
         raise HTTPException(status_code=500, detail=str(e))
 
     return Response(status_code=204)
@@ -122,52 +119,52 @@ async def handle_drive_notification(request: Request):
 @app.post("/renew-all-watches")
 async def renew_all_watches():
     """
-    全監視対象ユーザーのWatchチャネルを更新するエンドポイント (FR-04)
-    Cloud Schedulerから定期的に呼び出されることを想定
+    環境変数で指定された全ユーザーのWatchチャネルを更新する。
     """
-    print("Starting renewal process for all watch channels...")
-    users_ref = db.collection('monitored_users').stream()
+    if not PUBSUB_TOPIC_NAME:
+        raise HTTPException(status_code=500, detail="PUBSUB_TOPIC_NAME environment variable is not set.")
+    if not MONITORED_USERS:
+        raise HTTPException(status_code=500, detail="MONITORED_USERS environment variable is not set or empty.")
+
+    # 環境変数からメールアドレスのリストを作成
+    user_list = [email.strip() for email in MONITORED_USERS.split(',') if email.strip()]
+    
+    print(f"Starting renewal process for watch channels. Target users: {user_list}")
     success_count = 0
     failure_count = 0
 
-    for user_doc in users_ref:
-        user_data = user_doc.to_dict()
-        user_email = user_data.get("email")
-        if not user_email:
-            continue
-
+    for user_email in user_list:
         try:
             print(f"Processing user: {user_email}")
             creds = get_impersonated_credentials(user_email)
             drive_service = build('drive', 'v3', credentials=creds)
 
             # --- 1. 'Meet Recordings' フォルダのIDを取得 ---
-            folder_id = user_data.get('meetRecordingsFolderId')
-            if not folder_id:
-                # FirestoreにIDがなければ検索して保存
-                q = "name='Meet Recordings' and mimeType='application/vnd.google-apps.folder'"
-                response = drive_service.files().list(q=q, spaces='drive', fields='files(id, name)').execute()
-                files = response.get('files', [])
-                if not files:
-                    raise FileNotFoundError(f"'Meet Recordings' folder not found for user {user_email}")
-                folder_id = files[0].get('id')
-                # Firestoreドキュメントを更新
-                user_doc.reference.update({'meetRecordingsFolderId': folder_id})
+            q = "name='Meet Recordings' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            response = drive_service.files().list(
+                q=q, spaces='drive', fields='files(id, name)', pageSize=1
+            ).execute()
+            
+            files = response.get('files', [])
+            if not files:
+                raise FileNotFoundError(f"'Meet Recordings' folder not found for user {user_email}")
+            folder_id = files[0].get('id')
             
             print(f"Found 'Meet Recordings' folder with ID: {folder_id}")
 
             # --- 2. watchリクエストを送信 ---
-            channel_id = str(uuid.uuid4()) # 新しい監視ごとにユニークなIDを生成
+            channel_id = str(uuid.uuid4())
             watch_request_body = {
                 "id": channel_id,
                 "type": "web_hook",
-                "address": f"https://pubsub.googleapis.com/v1/{PUBSUB_TOPIC_NAME}:publish",
-                "token": user_email,  # 通知時にユーザーを特定するためのトークン
+                "address": f"https://www.googleapis.com/drive/v3/changes/watch",
+                "token": user_email,
+                "payload": True,
             }
-
+            
             drive_service.files().watch(fileId=folder_id, body=watch_request_body).execute()
             
-            print(f"Successfully renewed watch channel for user: {user_email}")
+            print(f"Successfully renewed watch channel for user: {user_email} on folder {folder_id}")
             success_count += 1
         
         except Exception as e:
@@ -177,6 +174,7 @@ async def renew_all_watches():
     summary = f"Renewal process finished. Success: {success_count}, Failure: {failure_count}"
     print(summary)
     return {"status": "completed", "summary": summary}
+
 
 @app.get("/")
 def read_root():
