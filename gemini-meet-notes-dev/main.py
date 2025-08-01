@@ -34,6 +34,14 @@ SERVICE_ACCOUNT_SECRET_NAME = os.getenv('SERVICE_ACCOUNT_SECRET_NAME')
 SERVICE_ACCOUNT_FILE_PATH = os.getenv('SERVICE_ACCOUNT_FILE_PATH')
 MONITORED_USERS = os.getenv('MONITORED_USERS', '')
 
+# 環境変数の初期検証
+if SERVICE_ACCOUNT_SECRET_NAME:
+    if SERVICE_ACCOUNT_SECRET_NAME.startswith('{') or SERVICE_ACCOUNT_SECRET_NAME.startswith('['):
+        logger.error(f"CRITICAL: SERVICE_ACCOUNT_SECRET_NAME contains JSON data: {SERVICE_ACCOUNT_SECRET_NAME[:50]}...")
+        logger.error("This should be a simple secret name like 'service-account-key'")
+        logger.error("Please fix the environment variable configuration in Cloud Run")
+        SERVICE_ACCOUNT_SECRET_NAME = None  # Force fallback to prevent further errors
+
 # Google APIスコープ
 SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',
@@ -63,13 +71,28 @@ app = FastAPI(
 def _get_credentials_from_secret_manager(secret_name: str, subject_email: str) -> service_account.Credentials:
     """Secret Managerからサービスアカウントキーを安全に取得"""
     try:
+        # 環境変数の検証（JSONデータが設定されていないかチェック）
+        if not secret_name or secret_name.startswith('{') or secret_name.startswith('['):
+            logger.error(f"Invalid secret name detected: '{secret_name[:20]}...'")
+            logger.error("SERVICE_ACCOUNT_SECRET_NAME environment variable contains JSON data instead of secret name")
+            logger.error("Expected format: 'service-account-key' (secret name only)")
+            raise ValueError("Invalid SERVICE_ACCOUNT_SECRET_NAME: contains JSON data instead of secret name")
+        
+        # 正しいシークレット名の形式をチェック
+        if '/' in secret_name or secret_name.startswith('projects/'):
+            logger.error(f"Secret name should not contain path: {secret_name}")
+            logger.error("Use only the secret name: 'service-account-key'")
+            raise ValueError("SECRET_ACCOUNT_SECRET_NAME should be secret name only, not full path")
+        
+        logger.info(f"Accessing Secret Manager with secret name: '{secret_name}'")
+        
         # Application Default Credentialsを使用してSecret Managerクライアントを作成
         client = secretmanager.SecretManagerServiceClient()
         
-        # 正しいSecret名フォーマットを使用（パス形式ではなくシークレット名のみ）
+        # 正しいSecret名フォーマットを使用
         name = f"projects/{GCP_PROJECT_ID}/secrets/{secret_name}/versions/latest"
+        logger.info(f"Secret Manager path: {name}")
         
-        logger.info(f"Accessing Secret Manager: {secret_name}")
         response = client.access_secret_version(request={"name": name})
         
         key_data = response.payload.data.decode("UTF-8")
@@ -80,12 +103,16 @@ def _get_credentials_from_secret_manager(secret_name: str, subject_email: str) -
             key_info = json.loads(key_data)
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON format in secret: {str(e)[:50]}...")
+            logger.error(f"Retrieved data length: {len(key_data)} characters")
+            logger.error(f"Data starts with: {key_data[:50]}...")
             raise ValueError("Secret contains invalid JSON data")
         
         # 必要なフィールドの確認
         required_fields = ['type', 'project_id', 'private_key_id', 'private_key', 'client_email', 'client_id']
         missing_fields = [field for field in required_fields if field not in key_info]
         if missing_fields:
+            logger.error(f"Secret missing required fields: {missing_fields}")
+            logger.error(f"Available fields: {list(key_info.keys())}")
             raise ValueError(f"Secret missing required fields: {missing_fields}")
         
         # サービスアカウント認証情報を作成
@@ -100,8 +127,9 @@ def _get_credentials_from_secret_manager(secret_name: str, subject_email: str) -
         return delegated_credentials
         
     except Exception as e:
-        logger.error(f"Secret Manager authentication failed: {str(e)[:100]}...")
-        # 機密情報がログに出力されないよう注意
+        logger.error(f"Secret Manager authentication failed: {str(e)[:200]}...")
+        logger.error(f"Secret name was: '{secret_name}'")
+        logger.error(f"GCP Project ID: '{GCP_PROJECT_ID}'")
         raise
 
 def _get_credentials_from_file(file_path: str, subject_email: str) -> service_account.Credentials:
@@ -302,11 +330,35 @@ async def health_check():
             "service_account_file": bool(SERVICE_ACCOUNT_FILE_PATH and os.path.exists(SERVICE_ACCOUNT_FILE_PATH))
         }
         
+        # 環境変数の詳細チェック
+        secret_name_raw = os.getenv('SERVICE_ACCOUNT_SECRET_NAME')
+        secret_name_valid = bool(SERVICE_ACCOUNT_SECRET_NAME and not SERVICE_ACCOUNT_SECRET_NAME.startswith('{'))
+        
+        # 基本設定の確認
+        config_status = {
+            "gcp_project_id": bool(GCP_PROJECT_ID),
+            "webhook_url": bool(WEBHOOK_URL),
+            "monitored_users": len(monitored_users),
+            "secret_manager": secret_name_valid,
+            "secret_manager_raw": secret_name_raw[:20] + "..." if secret_name_raw else None,
+            "secret_manager_is_json": secret_name_raw and secret_name_raw.startswith('{') if secret_name_raw else False,
+            "service_account_file": bool(SERVICE_ACCOUNT_FILE_PATH and os.path.exists(SERVICE_ACCOUNT_FILE_PATH))
+        }
+        
+        # 警告メッセージ
+        warnings = []
+        if secret_name_raw and secret_name_raw.startswith('{'):
+            warnings.append("SERVICE_ACCOUNT_SECRET_NAME contains JSON data instead of secret name")
+        
+        if not secret_name_valid and not SERVICE_ACCOUNT_FILE_PATH:
+            warnings.append("No valid authentication method configured")
+        
         return {
-            "status": "healthy",
-            "version": "2.0.0",
+            "status": "healthy" if not warnings else "warning",
+            "version": "2.1.1",
             "config": config_status,
-            "users": list(monitored_users.keys())
+            "users": list(monitored_users.keys()),
+            "warnings": warnings
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
