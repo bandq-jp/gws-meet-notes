@@ -68,8 +68,8 @@ def get_impersonated_credentials(subject_email: str):
         print(f"Getting credentials for user: {subject_email}")
         
         # 方法1: Secret Managerからサービスアカウントキーを取得
-        secret_name = os.getenv('SERVICE_ACCOUNT_SECRET_NAME', 'service-account-key')
-        if secret_name:
+        secret_name = os.getenv('SERVICE_ACCOUNT_SECRET_NAME')
+        if secret_name and GCP_PROJECT_ID:
             try:
                 from google.cloud import secretmanager
                 
@@ -81,6 +81,9 @@ def get_impersonated_credentials(subject_email: str):
                 # Secret Managerからキーデータを取得
                 key_data = response.payload.data.decode("UTF-8")
                 
+                # デバッグ: キーデータの最初の部分のみ表示
+                print("Successfully fetched service account key from Secret Manager")
+                
                 # JSONデータから認証情報を作成
                 import json
                 key_info = json.loads(key_data)
@@ -88,11 +91,13 @@ def get_impersonated_credentials(subject_email: str):
                     key_info, scopes=SCOPES
                 )
                 
-                print("Successfully loaded service account from Secret Manager")
+                print("Successfully loaded service account credentials with domain delegation")
                 return credentials.with_subject(subject_email)
                 
             except Exception as secret_error:
                 print(f"Failed to load from Secret Manager: {secret_error}")
+        else:
+            print(f"No secret name provided. SECRET_NAME: {secret_name}, PROJECT_ID: {GCP_PROJECT_ID}")
         
         # 方法2: 環境変数でサービスアカウントキーファイルパスが指定されている場合
         service_account_file = os.getenv('SERVICE_ACCOUNT_FILE_PATH')
