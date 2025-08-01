@@ -54,50 +54,49 @@ app = FastAPI(
 def get_impersonated_credentials(subject_email: str):
     """
     指定されたユーザーになりすますための認証情報を生成する。
-    Cloud Runのサービスアカウント認証を使用してドメイン全体の委任を行う。
+    Cloud Runのサービスアカウントを使用してドメイン全体の委任を行う。
     """
     try:
-        # Cloud Runの場合：環境のサービスアカウント認証を使用
-        if SERVICE_ACCOUNT_EMAIL:
-            # 指定されたサービスアカウントでドメイン全体の委任
-            credentials, _ = google.auth.default()
-            
-            # サービスアカウントの認証情報をドメイン全体の委任用に変換
-            jwt_credentials = service_account.Credentials(
-                signer=credentials.signer,
-                service_account_email=SERVICE_ACCOUNT_EMAIL,
-                project_id=credentials.project_id,
-                scopes=SCOPES
-            )
-            return jwt_credentials.with_subject(subject_email)
-        else:
-            # フォールバック：デフォルト認証でimpersonation
-            credentials, _ = google.auth.default(scopes=SCOPES)
-            
-            # Google Cloud Identity and Access Management (IAM) API を使用してimpersonation
-            from google.oauth2 import impersonated_credentials
-            
-            target_credentials = impersonated_credentials.Credentials(
-                source_credentials=credentials,
-                target_principal=SERVICE_ACCOUNT_EMAIL or credentials.service_account_email,
-                target_scopes=SCOPES,
-                delegates=[]
-            )
-            
-            return target_credentials.with_subject(subject_email) if hasattr(target_credentials, 'with_subject') else target_credentials
-            
-    except Exception as e:
-        print(f"Authentication error: {e}")
-        # 最終フォールバック：ローカル開発用
-        service_account_file = os.getenv('SERVICE_ACCOUNT_FILE_PATH', './service_account.json')
-        if os.path.exists(service_account_file):
-            print(f"Using service account file: {service_account_file}")
-            credentials = service_account.Credentials.from_service_account_file(
-                service_account_file, scopes=SCOPES
-            )
+        print(f"Getting credentials for user: {subject_email}")
+        
+        # Cloud Runのdefault認証を取得（サービスアカウント）
+        credentials, project_id = google.auth.default(scopes=SCOPES)
+        print(f"Default credentials obtained. Service account: {getattr(credentials, 'service_account_email', 'Unknown')}")
+        
+        # サービスアカウントがドメイン全体の委任権限を持っている場合
+        if hasattr(credentials, 'with_subject'):
+            print(f"Using domain-wide delegation for: {subject_email}")
             return credentials.with_subject(subject_email)
         else:
-            raise Exception(f"No valid authentication method found. Error: {e}")
+            # service_account.Credentialsに変換してwith_subjectを使用
+            if hasattr(credentials, 'service_account_email'):
+                print(f"Converting to service account credentials with domain delegation")
+                
+                # Cloud Runのメタデータから秘密鍵情報を取得することはできないため、
+                # 別のアプローチを使用
+                from google.auth import iam
+                from google.auth.transport.requests import Request as AuthRequest
+                
+                # IAM Service Account Credentials APIを使用
+                signer = iam.Signer(AuthRequest(), credentials, credentials.service_account_email)
+                
+                # 新しいCredentialsオブジェクトを作成
+                delegated_credentials = service_account.Credentials(
+                    signer=signer,
+                    service_account_email=credentials.service_account_email,
+                    project_id=project_id or GCP_PROJECT_ID,
+                    scopes=SCOPES
+                )
+                
+                return delegated_credentials.with_subject(subject_email)
+            else:
+                print("Warning: Cannot perform domain-wide delegation. Using default credentials.")
+                return credentials
+                
+    except Exception as e:
+        print(f"Authentication error: {e}")
+        print("Make sure the Cloud Run service account has domain-wide delegation enabled.")
+        raise Exception(f"Authentication failed: {e}")
 
 
 # --- APIクライアント生成は各関数内で実装 ---
