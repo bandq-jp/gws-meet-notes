@@ -1,0 +1,15 @@
+[project]
+name = "gemini-meet-notes-dev"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-api-python-client>=2.177.0",
+    "google-auth>=2.40.3",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.2",
+    "google-cloud-functions>=0.1.0",
+    "google-cloud-pubsub>=2.22.0",
+    "python-dotenv>=1.0.0",
+]

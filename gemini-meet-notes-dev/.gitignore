@@ -1,0 +1,31 @@
+# 認証関連ファイル
+credentials.json
+token.json
+
+# データベースファイル
+meet_notes.db
+
+# ログファイル
+meet_notes.log
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+service_account.json
