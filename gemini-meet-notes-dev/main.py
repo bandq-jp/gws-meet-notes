@@ -54,48 +54,78 @@ app = FastAPI(
 def get_impersonated_credentials(subject_email: str):
     """
     指定されたユーザーになりすますための認証情報を生成する。
-    Cloud Runのサービスアカウントを使用してドメイン全体の委任を行う。
+    
+    注意：Google Workspace APIでドメイン全体の委任を使用するには、
+    サービスアカウントキーファイルが必要です。Cloud Runの実行時認証では
+    ドメイン全体の委任ができません。
+    
+    代替案：
+    1. サービスアカウントキーファイルを使用（最も確実）
+    2. 個別ユーザー認証（OAuth2）
+    3. 特定の制限された範囲でのアクセス
     """
     try:
         print(f"Getting credentials for user: {subject_email}")
         
-        # Cloud Runのdefault認証を取得（サービスアカウント）
-        credentials, project_id = google.auth.default(scopes=SCOPES)
-        print(f"Default credentials obtained. Service account: {getattr(credentials, 'service_account_email', 'Unknown')}")
-        
-        # サービスアカウントがドメイン全体の委任権限を持っている場合
-        if hasattr(credentials, 'with_subject'):
-            print(f"Using domain-wide delegation for: {subject_email}")
-            return credentials.with_subject(subject_email)
-        else:
-            # service_account.Credentialsに変換してwith_subjectを使用
-            if hasattr(credentials, 'service_account_email'):
-                print(f"Converting to service account credentials with domain delegation")
+        # 方法1: Secret Managerからサービスアカウントキーを取得
+        secret_name = os.getenv('SERVICE_ACCOUNT_SECRET_NAME', 'service-account-key')
+        if secret_name:
+            try:
+                from google.cloud import secretmanager
                 
-                # Cloud Runのメタデータから秘密鍵情報を取得することはできないため、
-                # 別のアプローチを使用
-                from google.auth import iam
-                from google.auth.transport.requests import Request as AuthRequest
+                print(f"Fetching service account key from Secret Manager: {secret_name}")
+                client = secretmanager.SecretManagerServiceClient()
+                name = f"projects/{GCP_PROJECT_ID}/secrets/{secret_name}/versions/latest"
+                response = client.access_secret_version(request={"name": name})
                 
-                # IAM Service Account Credentials APIを使用
-                signer = iam.Signer(AuthRequest(), credentials, credentials.service_account_email)
+                # Secret Managerからキーデータを取得
+                key_data = response.payload.data.decode("UTF-8")
                 
-                # 新しいCredentialsオブジェクトを作成
-                delegated_credentials = service_account.Credentials(
-                    signer=signer,
-                    service_account_email=credentials.service_account_email,
-                    project_id=project_id or GCP_PROJECT_ID,
-                    scopes=SCOPES
+                # JSONデータから認証情報を作成
+                import json
+                key_info = json.loads(key_data)
+                credentials = service_account.Credentials.from_service_account_info(
+                    key_info, scopes=SCOPES
                 )
                 
-                return delegated_credentials.with_subject(subject_email)
-            else:
-                print("Warning: Cannot perform domain-wide delegation. Using default credentials.")
-                return credentials
+                print("Successfully loaded service account from Secret Manager")
+                return credentials.with_subject(subject_email)
+                
+            except Exception as secret_error:
+                print(f"Failed to load from Secret Manager: {secret_error}")
+        
+        # 方法2: 環境変数でサービスアカウントキーファイルパスが指定されている場合
+        service_account_file = os.getenv('SERVICE_ACCOUNT_FILE_PATH')
+        if service_account_file and os.path.exists(service_account_file):
+            print(f"Using service account file: {service_account_file}")
+            credentials = service_account.Credentials.from_service_account_file(
+                service_account_file, scopes=SCOPES
+            )
+            return credentials.with_subject(subject_email)
+        
+        # 方法2: Cloud Runのデフォルト認証（制限あり）
+        print("Using Cloud Run default credentials (limited access)")
+        credentials, project_id = google.auth.default(scopes=SCOPES)
+        print(f"Service account: {getattr(credentials, 'service_account_email', 'Unknown')}")
+        
+        # ドメイン全体の委任はできないが、とりあえず試行
+        if hasattr(credentials, 'with_subject'):
+            print(f"Attempting domain-wide delegation for: {subject_email}")
+            return credentials.with_subject(subject_email)
+        else:
+            print("Warning: Domain-wide delegation not available with Cloud Run default credentials.")
+            print("Consider using a service account key file for full functionality.")
+            
+            # 制限された認証情報を返す（一部機能のみ動作）
+            return credentials
                 
     except Exception as e:
         print(f"Authentication error: {e}")
-        print("Make sure the Cloud Run service account has domain-wide delegation enabled.")
+        print("\nTo fix this issue:")
+        print("1. Create a service account key file with domain-wide delegation")
+        print("2. Upload it to your Cloud Run container")
+        print("3. Set SERVICE_ACCOUNT_FILE_PATH environment variable")
+        print("4. Or configure OAuth2 for individual user consent")
         raise Exception(f"Authentication failed: {e}")
 
 
