@@ -1,9 +1,25 @@
-fastapi
-uvicorn[standard]
-google-api-python-client
-google-auth
-google-auth-oauthlib
-google-cloud-firestore
-google-cloud-secret-manager
-python-dotenv
-pydantic
+# Web Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Google Cloud & APIs
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-cloud-secret-manager>=2.16.0
+google-cloud-firestore>=2.13.0
+
+# HTTP Requests
+requests>=2.31.0
+
+# JWT handling
+PyJWT>=2.8.0
+
+# Data validation
+pydantic>=2.4.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Date/time handling
+python-dateutil>=2.8.2

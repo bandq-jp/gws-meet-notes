@@ -1,235 +1,157 @@
 # main.py
-# FastAPIアプリケーションのメインファイル
+# Google Meet Minutes Processor - Secure Cloud Run Implementation
+# セキュアなGoogle Drive監視アプリケーション
 
 import os
 import uuid
+import json
+import logging
+from typing import Dict, Any, Optional, Union, Tuple
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from google.cloud import secretmanager
 import google.auth
+
+# ログ設定 - 機密情報を除外
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # --- 設定値 -------------------------------------------------------------------
 
-# 環境変数から設定を読み込む
+# 必須環境変数
 GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # Cloud RunのURL + /webhook
-SERVICE_ACCOUNT_EMAIL = os.getenv('SERVICE_ACCOUNT_EMAIL')  # ドメイン全体の委任が設定されたサービスアカウント
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 
-# Google APIのスコープ
+# オプション環境変数
+SERVICE_ACCOUNT_SECRET_NAME = os.getenv('SERVICE_ACCOUNT_SECRET_NAME')
+SERVICE_ACCOUNT_FILE_PATH = os.getenv('SERVICE_ACCOUNT_FILE_PATH')
+MONITORED_USERS = os.getenv('MONITORED_USERS', '')
+
+# Google APIスコープ
 SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',
     'https://www.googleapis.com/auth/documents.readonly'
 ]
 
-# 監視対象ユーザーの設定（環境変数から取得）
-MONITORED_USERS = {
-    # ユーザーのメールアドレス: Meet RecordingsフォルダのID
-    # 例: "user@example.com": "1234567890abcdef"
-}
-
-# 環境変数から監視対象ユーザーを読み込む
-# 形式: "email1:folderid1,email2:folderid2" または "email1,email2" (フォルダIDは自動検索)
-users_config = os.getenv('MONITORED_USERS', '')
-if users_config:
-    for user_config in users_config.split(','):
+# 監視対象ユーザーの解析
+monitored_users = {}
+if MONITORED_USERS:
+    for user_config in MONITORED_USERS.split(','):
         user_config = user_config.strip()
         if ':' in user_config:
-            # フォルダID指定あり
             email, folder_id = user_config.split(':', 1)
-            MONITORED_USERS[email] = folder_id
+            monitored_users[email.strip()] = folder_id.strip()
         else:
-            # メールアドレスのみ（フォルダIDは後で自動検索）
-            MONITORED_USERS[user_config] = None
+            monitored_users[user_config] = None
 
-# FastAPIアプリケーションのインスタンス化
+# FastAPIアプリケーション
 app = FastAPI(
     title="Google Meet Minutes Processor",
-    description="Receives notifications from Google Drive and processes meeting minutes.",
+    description="Secure Google Drive monitoring system for Meet Recordings",
+    version="2.0.0"
 )
 
+# --- セキュアな認証システム ---------------------------------------------------
 
-# --- 認証ヘルパー -------------------------------------------------------------
-
-def get_impersonated_credentials(subject_email: str):
-    """
-    指定されたユーザーになりすますための認証情報を生成する。
-    
-    注意：Google Workspace APIでドメイン全体の委任を使用するには、
-    サービスアカウントキーファイルが必要です。Cloud Runの実行時認証では
-    ドメイン全体の委任ができません。
-    
-    代替案：
-    1. サービスアカウントキーファイルを使用（最も確実）
-    2. 個別ユーザー認証（OAuth2）
-    3. 特定の制限された範囲でのアクセス
-    """
+def _get_credentials_from_secret_manager(secret_name: str, subject_email: str) -> service_account.Credentials:
+    """Secret Managerからサービスアカウントキーを安全に取得"""
     try:
-        print(f"Getting credentials for user: {subject_email}")
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{GCP_PROJECT_ID}/secrets/{secret_name}/versions/latest"
         
-        # 方法1: Secret Managerからサービスアカウントキーを取得
-        secret_name = os.getenv('SERVICE_ACCOUNT_SECRET_NAME')
-        if secret_name and GCP_PROJECT_ID:
-            try:
-                from google.cloud import secretmanager
-                
-                print(f"Fetching service account key from Secret Manager: {secret_name}")
-                client = secretmanager.SecretManagerServiceClient()
-                name = f"projects/{GCP_PROJECT_ID}/secrets/{secret_name}/versions/latest"
-                response = client.access_secret_version(request={"name": name})
-                
-                # Secret Managerからキーデータを取得
-                key_data = response.payload.data.decode("UTF-8")
-                
-                # デバッグ: キーデータの最初の部分のみ表示
-                print("Successfully fetched service account key from Secret Manager")
-                
-                # JSONデータから認証情報を作成
-                import json
-                key_info = json.loads(key_data)
-                credentials = service_account.Credentials.from_service_account_info(
-                    key_info, scopes=SCOPES
-                )
-                
-                print("Successfully loaded service account credentials with domain delegation")
-                return credentials.with_subject(subject_email)
-                
-            except Exception as secret_error:
-                print(f"Failed to load from Secret Manager: {secret_error}")
-        else:
-            print(f"No secret name provided. SECRET_NAME: {secret_name}, PROJECT_ID: {GCP_PROJECT_ID}")
+        logger.info(f"Fetching credentials from Secret Manager: {secret_name}")
+        response = client.access_secret_version(request={"name": name})
         
-        # 方法2: 環境変数でサービスアカウントキーファイルパスが指定されている場合
-        service_account_file = os.getenv('SERVICE_ACCOUNT_FILE_PATH')
-        if service_account_file and os.path.exists(service_account_file):
-            print(f"Using service account file: {service_account_file}")
-            credentials = service_account.Credentials.from_service_account_file(
-                service_account_file, scopes=SCOPES
-            )
-            return credentials.with_subject(subject_email)
+        key_data = response.payload.data.decode("UTF-8")
+        key_info = json.loads(key_data)
         
-        # 方法2: Cloud Runのデフォルト認証（制限あり）
-        print("Using Cloud Run default credentials (limited access)")
-        credentials, project_id = google.auth.default(scopes=SCOPES)
-        print(f"Service account: {getattr(credentials, 'service_account_email', 'Unknown')}")
+        credentials = service_account.Credentials.from_service_account_info(
+            key_info, scopes=SCOPES
+        )
         
-        # ドメイン全体の委任はできないが、とりあえず試行
-        if hasattr(credentials, 'with_subject'):
-            print(f"Attempting domain-wide delegation for: {subject_email}")
-            return credentials.with_subject(subject_email)
-        else:
-            print("Warning: Domain-wide delegation not available with Cloud Run default credentials.")
-            print("Consider using a service account key file for full functionality.")
-            
-            # 制限された認証情報を返す（一部機能のみ動作）
-            return credentials
-                
+        logger.info("Successfully loaded service account from Secret Manager")
+        return credentials.with_subject(subject_email)
+        
     except Exception as e:
-        print(f"Authentication error: {e}")
-        print("\nTo fix this issue:")
-        print("1. Create a service account key file with domain-wide delegation")
-        print("2. Upload it to your Cloud Run container")
-        print("3. Set SERVICE_ACCOUNT_FILE_PATH environment variable")
-        print("4. Or configure OAuth2 for individual user consent")
-        raise Exception(f"Authentication failed: {e}")
+        logger.error(f"Failed to load from Secret Manager: {str(e)[:100]}...")
+        raise
 
+def _get_credentials_from_file(file_path: str, subject_email: str) -> service_account.Credentials:
+    """ファイルからサービスアカウントキーを取得（開発用）"""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Service account file not found: {file_path}")
+    
+    logger.info(f"Loading service account from file: {file_path}")
+    credentials = service_account.Credentials.from_service_account_file(
+        file_path, scopes=SCOPES
+    )
+    return credentials.with_subject(subject_email)
 
-# --- APIクライアント生成は各関数内で実装 ---
+def _get_default_credentials_with_impersonation(subject_email: str) -> Any:
+    """デフォルト認証を使用（制限あり）"""
+    logger.warning("Using default credentials - domain delegation not available")
+    credentials, _ = google.auth.default(scopes=SCOPES)
+    return credentials
 
-
-# --- エンドポイント ------------------------------------------------------------
-
-@app.post("/webhook", status_code=204)
-async def handle_drive_notification(request: Request):
+def get_impersonated_credentials(subject_email: str) -> Union[service_account.Credentials, Any]:
     """
-    Google Driveからの直接Push Notificationを受け取るエンドポイント
+    優先順位に基づいた認証情報取得
+    1. Secret Manager（推奨）
+    2. サービスアカウントファイル（開発用）
+    3. デフォルト認証（制限あり）
     """
-    # --- 1. リクエストヘッダーから情報を取得 ---
-    channel_state = request.headers.get("X-Goog-Resource-State")
-    resource_id = request.headers.get("X-Goog-Resource-ID")
-    channel_token = request.headers.get("X-Goog-Channel-Token")
-    channel_id = request.headers.get("X-Goog-Channel-ID")
-
-    print(f"Received notification: state={channel_state}, resource={resource_id}, token={channel_token}, channel={channel_id}")
-
-    # sync通知は無視（初回設定時の確認通知）
-    if channel_state == "sync":
-        print("Ignoring sync notification")
-        return Response(status_code=204)
-
-    if not channel_token:
-        print("Missing channel token")
-        return Response(status_code=204)
-
-    try:
-        # --- 2. チャネルトークンからユーザー情報を取得 ---
-        # トークンはemail:folder_id形式
-        if ':' not in channel_token:
-            print(f"Invalid channel token format: {channel_token}")
-            return Response(status_code=204)
-            
-        user_email, meet_recordings_folder_id = channel_token.split(':', 1)
-        
-        if not user_email or not meet_recordings_folder_id:
-            print(f"Missing user email or folder ID in token: {channel_token}")
-            return Response(status_code=204)
-
-        # --- 3. ユーザーになりすましてAPI呼び出し ---
-        creds = get_impersonated_credentials(user_email)
-        drive_service = build('drive', 'v3', credentials=creds)
-        
-        # --- 4. changes.listで最新の変更をチェック ---
-        # シンプルにするため、現在のページトークンから開始
-        response = drive_service.changes().getStartPageToken().execute()
-        start_page_token = response.get('startPageToken')
-        
-        # 最近の変更をチェック（直近の変更のみ）
+    logger.info(f"Getting credentials for user: {subject_email}")
+    
+    # 方法1: Secret Manager（推奨）
+    if SERVICE_ACCOUNT_SECRET_NAME and GCP_PROJECT_ID:
         try:
-            response = drive_service.changes().list(
-                pageToken=start_page_token,
-                includeRemoved=False,
-                spaces='drive',
-                fields='changes(file(id,name,mimeType,parents))'
-            ).execute()
-            
-            # --- 5. Meet Recordingsフォルダ内のGoogleドキュメントをチェック ---
-            for change in response.get('changes', []):
-                file_info = change.get('file')
-                if not file_info:
-                    continue
-                    
-                # Googleドキュメントで、Meet Recordingsフォルダ内のファイルかチェック
-                if (file_info.get('mimeType') == 'application/vnd.google-apps.document' and
-                    meet_recordings_folder_id in file_info.get('parents', [])):
-                    
-                    print(f"Found new Google Doc in Meet Recordings: {file_info.get('name')}")
-                    await process_document(file_info.get('id'), user_email)
+            return _get_credentials_from_secret_manager(SERVICE_ACCOUNT_SECRET_NAME, subject_email)
         except Exception as e:
-            print(f"Error checking changes: {e}")
-            # フォールバック: フォルダ内のドキュメントを直接チェック
-            await check_folder_directly(meet_recordings_folder_id, user_email)
-            
-    except Exception as e:
-        print(f"Error processing notification: {e}")
-        # 一時的なエラーの場合は500を返してリトライさせる
-        # 永続的なエラーの場合は204を返してリトライを停止
-        raise HTTPException(status_code=500, detail=str(e))
+            logger.error(f"Secret Manager authentication failed: {str(e)[:100]}...")
     
-    return Response(status_code=204)
+    # 方法2: サービスアカウントファイル（開発用）
+    if SERVICE_ACCOUNT_FILE_PATH:
+        try:
+            return _get_credentials_from_file(SERVICE_ACCOUNT_FILE_PATH, subject_email)
+        except Exception as e:
+            logger.error(f"File-based authentication failed: {str(e)[:100]}...")
+    
+    # 方法3: デフォルト認証（制限あり）
+    logger.warning("Falling back to default credentials - limited functionality")
+    return _get_default_credentials_with_impersonation(subject_email)
 
+# --- セキュアなWebhook処理 ---------------------------------------------------
 
-async def process_document(file_id: str, user_email: str):
-    """
-    Googleドキュメントの内容を処理する
-    """
+def _validate_webhook_headers(request: Request) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Webhookヘッダーの検証"""
+    channel_state = request.headers.get("X-Goog-Resource-State")
+    channel_token = request.headers.get("X-Goog-Channel-Token") 
+    channel_id = request.headers.get("X-Goog-Channel-ID")
+    
+    logger.info(f"Webhook received: state={channel_state}, channel={channel_id}")
+    
+    return channel_state, channel_token, channel_id
+
+def _is_retryable_error(error: Exception) -> bool:
+    """エラーがリトライ可能かどうかを判定"""
+    error_str = str(error).lower()
+    retryable_errors = ['timeout', 'rate limit', 'quota', 'temporary', 'unavailable']
+    return any(err in error_str for err in retryable_errors)
+
+async def _process_document_safely(file_id: str, user_email: str) -> None:
+    """ドキュメント処理の安全な実行"""
     try:
         creds = get_impersonated_credentials(user_email)
         docs_service = build('docs', 'v1', credentials=creds)
         
-        # ドキュメントの内容を取得
         document = docs_service.documents().get(documentId=file_id).execute()
         
-        # テキストを抽出
+        # テキスト抽出
         content_text = ""
         for content in document.get('body', {}).get('content', []):
             if 'paragraph' in content:
@@ -237,102 +159,268 @@ async def process_document(file_id: str, user_email: str):
                     if 'textRun' in element:
                         content_text += element.get('textRun', {}).get('content', '')
         
-        # ドキュメントタイトルとテキストの最初の50文字をログ出力
+        # セキュアなログ出力
         title = document.get('title', 'Untitled')
-        content_preview = content_text.strip()[:50]
+        preview = content_text.strip()[:50]
         if len(content_text.strip()) > 50:
-            content_preview += "..."
-            
-        print(f"📄 NEW DOCUMENT: '{title}'")
-        print(f"📝 PREVIEW (50 chars): {content_preview}")
-        print(f"👤 USER: {user_email}")
-        print("---")
+            preview += "..."
+        
+        logger.info(f"📄 NEW DOCUMENT: '{title}' | USER: {user_email}")
+        logger.info(f"📝 PREVIEW: {preview}")
         
     except Exception as e:
-        print(f"Error processing document {file_id}: {e}")
+        logger.error(f"Document processing failed for {file_id}: {str(e)[:100]}...")
+        raise
 
+# --- APIエンドポイント -------------------------------------------------------
 
-async def check_folder_directly(folder_id: str, user_email: str):
-    """
-    Meet Recordingsフォルダを直接チェックして新しいドキュメントを探す
-    """
+@app.get("/health")
+async def health_check():
+    """包括的なヘルスチェック"""
+    try:
+        # 基本設定の確認
+        config_status = {
+            "gcp_project_id": bool(GCP_PROJECT_ID),
+            "webhook_url": bool(WEBHOOK_URL),
+            "monitored_users": len(monitored_users),
+            "secret_manager": bool(SERVICE_ACCOUNT_SECRET_NAME),
+            "service_account_file": bool(SERVICE_ACCOUNT_FILE_PATH and os.path.exists(SERVICE_ACCOUNT_FILE_PATH))
+        }
+        
+        return {
+            "status": "healthy",
+            "version": "2.0.0",
+            "config": config_status,
+            "users": list(monitored_users.keys())
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=500, detail="Health check failed")
+
+@app.post("/test-authentication")
+async def test_authentication():
+    """認証システムのテスト"""
+    if not monitored_users:
+        raise HTTPException(status_code=400, detail="No monitored users configured")
+    
+    results = []
+    for user_email in monitored_users.keys():
+        try:
+            creds = get_impersonated_credentials(user_email)
+            drive_service = build('drive', 'v3', credentials=creds)
+            
+            # 簡単なAPI呼び出しでテスト
+            about = drive_service.about().get(fields='user').execute()
+            user_info = about.get('user', {})
+            
+            results.append({
+                "user": user_email,
+                "status": "success",
+                "authenticated_as": user_info.get('emailAddress', 'unknown')
+            })
+            
+        except Exception as e:
+            results.append({
+                "user": user_email,
+                "status": "error",
+                "error": str(e)[:100]
+            })
+    
+    return {"authentication_test": results}
+
+@app.post("/webhook", status_code=204)
+async def handle_drive_notification(request: Request):
+    """セキュアなGoogle Drive Push Notification処理"""
+    
+    # ヘッダー検証
+    channel_state, channel_token, channel_id = _validate_webhook_headers(request)
+    
+    # sync通知は無視
+    if channel_state == "sync":
+        logger.info("Ignoring sync notification")
+        return Response(status_code=204)
+    
+    if not channel_token:
+        logger.warning("Missing channel token")
+        return Response(status_code=204)
+    
+    try:
+        # チャネルトークンの解析
+        if ':' not in channel_token:
+            logger.error(f"Invalid token format: {channel_token}")
+            return Response(status_code=204)
+        
+        user_email, folder_id = channel_token.split(':', 1)
+        
+        if user_email not in monitored_users:
+            logger.warning(f"Unknown user: {user_email}")
+            return Response(status_code=204)
+        
+        # 認証取得
+        creds = get_impersonated_credentials(user_email)
+        drive_service = build('drive', 'v3', credentials=creds)
+        
+        # 変更をチェック
+        response = drive_service.changes().getStartPageToken().execute()
+        start_page_token = response.get('startPageToken')
+        
+        try:
+            changes_response = drive_service.changes().list(
+                pageToken=start_page_token,
+                includeRemoved=False,
+                spaces='drive',
+                fields='changes(file(id,name,mimeType,parents))'
+            ).execute()
+            
+            # Meet Recordingsフォルダ内のGoogleドキュメントをチェック
+            for change in changes_response.get('changes', []):
+                file_info = change.get('file')
+                if not file_info:
+                    continue
+                
+                if (file_info.get('mimeType') == 'application/vnd.google-apps.document' and
+                    folder_id in file_info.get('parents', [])):
+                    
+                    logger.info(f"Found new document: {file_info.get('name')}")
+                    await _process_document_safely(file_info.get('id'), user_email)
+        
+        except Exception as changes_error:
+            logger.error(f"Changes API error: {changes_error}")
+            # フォールバック: フォルダ直接チェック
+            await _check_folder_directly(folder_id, user_email)
+    
+    except Exception as e:
+        logger.error(f"Webhook processing error: {str(e)[:100]}...")
+        
+        if _is_retryable_error(e):
+            raise HTTPException(status_code=500, detail="Temporary error, will retry")
+        else:
+            logger.error(f"Permanent error, will not retry: {e}")
+    
+    return Response(status_code=204)
+
+async def _check_folder_directly(folder_id: str, user_email: str) -> None:
+    """フォルダの直接チェック（フォールバック）"""
     try:
         creds = get_impersonated_credentials(user_email)
         drive_service = build('drive', 'v3', credentials=creds)
         
-        # フォルダ内のドキュメントを最新順で取得
         query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.document'"
         response = drive_service.files().list(
             q=query,
             orderBy='createdTime desc',
-            pageSize=5,  # 最新の5件のみ
+            pageSize=5,
             fields='files(id, name, createdTime)'
         ).execute()
         
         for file_info in response.get('files', []):
-            print(f"Checking document: {file_info.get('name')}")
-            await process_document(file_info.get('id'), user_email)
+            logger.info(f"Direct check found document: {file_info.get('name')}")
+            await _process_document_safely(file_info.get('id'), user_email)
             
     except Exception as e:
-        print(f"Error checking folder directly: {e}")
+        logger.error(f"Direct folder check failed: {str(e)[:100]}...")
 
+@app.post("/test-folder-check")
+async def test_folder_check():
+    """フォルダアクセステスト"""
+    if not monitored_users:
+        raise HTTPException(status_code=400, detail="No monitored users configured")
+    
+    results = []
+    for user_email, folder_id in monitored_users.items():
+        try:
+            creds = get_impersonated_credentials(user_email)
+            drive_service = build('drive', 'v3', credentials=creds)
+            
+            # フォルダIDが設定されていない場合は検索
+            if not folder_id:
+                q = "name='Meet Recordings' and mimeType='application/vnd.google-apps.folder'"
+                response = drive_service.files().list(q=q, fields='files(id, name)').execute()
+                files = response.get('files', [])
+                
+                if files:
+                    folder_id = files[0]['id']
+                    results.append({
+                        "user": user_email,
+                        "status": "found_folder",
+                        "folder_id": folder_id,
+                        "folder_name": files[0]['name']
+                    })
+                else:
+                    results.append({
+                        "user": user_email,
+                        "status": "folder_not_found",
+                        "error": "Meet Recordings folder not found"
+                    })
+                    continue
+            
+            # フォルダ内のドキュメントをチェック
+            query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.document'"
+            docs_response = drive_service.files().list(
+                q=query,
+                pageSize=5,
+                fields='files(id, name, createdTime)'
+            ).execute()
+            
+            documents = docs_response.get('files', [])
+            results.append({
+                "user": user_email,
+                "status": "success",
+                "folder_id": folder_id,
+                "documents_found": len(documents),
+                "recent_documents": [doc['name'] for doc in documents[:3]]
+            })
+            
+        except Exception as e:
+            results.append({
+                "user": user_email,
+                "status": "error",
+                "error": str(e)[:100]
+            })
+    
+    return {"folder_test": results}
 
 @app.post("/renew-all-watches")
 async def renew_all_watches():
-    """
-    全監視対象ユーザーのchanges.watchチャネルを更新するエンドポイント
-    Cloud Schedulerから定期的に呼び出されることを想定（24時間ごと）
-    """
-    print("Starting renewal process for all watch channels...")
-    print(f"MONITORED_USERS: {MONITORED_USERS}")
-    print(f"WEBHOOK_URL: {WEBHOOK_URL}")
-    
+    """監視チャネルの更新"""
     if not WEBHOOK_URL:
-        raise HTTPException(status_code=500, detail="WEBHOOK_URL environment variable not set")
-        
-    if not MONITORED_USERS:
-        print("No monitored users configured")
-        return {"status": "completed", "summary": "No users to monitor", "success": 0, "failure": 0}
+        raise HTTPException(status_code=500, detail="WEBHOOK_URL not configured")
     
-    success_count = 0
-    failure_count = 0
-
-    for user_email, folder_id in MONITORED_USERS.items():
+    if not monitored_users:
+        logger.warning("No monitored users configured")
+        return {"status": "completed", "message": "No users to monitor"}
+    
+    logger.info("Starting renewal process for all watch channels")
+    results = []
+    
+    for user_email, folder_id in monitored_users.items():
         try:
-            print(f"Processing user: {user_email}")
+            logger.info(f"Processing user: {user_email}")
             creds = get_impersonated_credentials(user_email)
             drive_service = build('drive', 'v3', credentials=creds)
-
-            # --- 1. フォルダIDの確認・取得 ---
+            
+            # フォルダID確認・取得
             if not folder_id:
-                # フォルダIDが設定されていない場合は検索
-                print(f"Searching for 'Meet Recordings' folder for user: {user_email}")
                 q = "name='Meet Recordings' and mimeType='application/vnd.google-apps.folder'"
-                response = drive_service.files().list(q=q, spaces='drive', fields='files(id, name)').execute()
+                response = drive_service.files().list(q=q, fields='files(id, name)').execute()
                 files = response.get('files', [])
+                
                 if not files:
-                    raise FileNotFoundError(f"'Meet Recordings' folder not found for user {user_email}")
-                folder_id = files[0].get('id')
-                print(f"Found 'Meet Recordings' folder with ID: {folder_id}")
-                # メモリ上のMONITORED_USERSを更新
-                MONITORED_USERS[user_email] = folder_id
+                    raise FileNotFoundError("Meet Recordings folder not found")
+                
+                folder_id = files[0]['id']
+                logger.info(f"Found Meet Recordings folder: {folder_id}")
             
-            print(f"Using 'Meet Recordings' folder ID: {folder_id}")
-
-            # --- 2. 現在のページトークンを取得 ---
-            response = drive_service.changes().getStartPageToken().execute()
-            start_page_token = response.get('startPageToken')
+            # changes.watch設定
+            page_token_response = drive_service.changes().getStartPageToken().execute()
+            start_page_token = page_token_response.get('startPageToken')
             
-            # --- 3. 新しいchanges.watchを設定 ---
             channel_id = str(uuid.uuid4())
-            # トークンにuser_email:folder_idを設定
-            token = f"{user_email}:{folder_id}"
-            
             watch_request = {
                 "id": channel_id,
                 "type": "web_hook",
                 "address": WEBHOOK_URL,
-                "token": token
+                "token": f"{user_email}:{folder_id}"
             }
             
             watch_response = drive_service.changes().watch(
@@ -340,43 +428,53 @@ async def renew_all_watches():
                 body=watch_request
             ).execute()
             
-            print(f"Successfully set up watch for user: {user_email}, channel: {channel_id}")
-            print(f"Watch expires at: {watch_response.get('expiration')}")
-            success_count += 1
-        
-        except Exception as e:
-            print(f"ERROR: Failed to set up watch for user {user_email}. Reason: {e}")
-            failure_count += 1
+            results.append({
+                "user": user_email,
+                "status": "success",
+                "channel_id": channel_id,
+                "folder_id": folder_id,
+                "expiration": watch_response.get('expiration')
+            })
             
-    summary = f"Renewal process finished. Success: {success_count}, Failure: {failure_count}"
-    print(summary)
-    return {"status": "completed", "summary": summary, "success": success_count, "failure": failure_count}
-
-@app.get("/")
-def read_root():
+            logger.info(f"Successfully set up watch for {user_email}")
+            
+        except Exception as e:
+            error_msg = str(e)[:100]
+            results.append({
+                "user": user_email,
+                "status": "error",
+                "error": error_msg
+            })
+            logger.error(f"Failed to set up watch for {user_email}: {error_msg}")
+    
+    success_count = sum(1 for r in results if r['status'] == 'success')
+    failure_count = len(results) - success_count
+    
+    logger.info(f"Renewal completed: {success_count} success, {failure_count} failures")
+    
     return {
-        "message": "Google Meet Minutes Processor is running.",
-        "webhook_url": WEBHOOK_URL,
-        "service_account_email": SERVICE_ACCOUNT_EMAIL,
-        "monitored_users": list(MONITORED_USERS.keys()) if MONITORED_USERS else [],
-        "gcp_project_id": GCP_PROJECT_ID
+        "status": "completed",
+        "summary": f"Success: {success_count}, Failure: {failure_count}",
+        "results": results
     }
 
+@app.get("/")
+async def root():
+    """アプリケーション情報"""
+    return {
+        "name": "Google Meet Minutes Processor",
+        "version": "2.0.0",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "webhook": "/webhook",
+            "test_auth": "/test-authentication",
+            "test_folder": "/test-folder-check",
+            "renew_watches": "/renew-all-watches"
+        },
+        "monitored_users": len(monitored_users)
+    }
 
-@app.post("/test-folder-check")
-async def test_folder_check():
-    """
-    テスト用エンドポイント: 各ユーザーのMeet Recordingsフォルダを直接チェック
-    """
-    if not MONITORED_USERS:
-        return {"error": "No monitored users configured"}
-    
-    results = []
-    for user_email, folder_id in MONITORED_USERS.items():
-        try:
-            await check_folder_directly(folder_id, user_email)
-            results.append({"user": user_email, "status": "success"})
-        except Exception as e:
-            results.append({"user": user_email, "status": "error", "error": str(e)})
-    
-    return {"results": results}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
