@@ -31,11 +31,7 @@ Cloud Runコンソールで「ソースから継続的にデプロイ」を選�
 
 ### 3. インフラ設定
 
-デプロイ後、以下のスクリプトを実行してGoogle Drive Push Notificationsを設定：
-
-```bash
-python setup_infrastructure.py
-```
+デプロイ後、Google Drive Push Notificationsを設定：
 
 ## 環境変数
 

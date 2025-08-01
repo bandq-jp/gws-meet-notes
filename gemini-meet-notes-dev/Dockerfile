@@ -1,40 +1,27 @@
-# Use Python 3.12 slim image
-FROM python:3.12-slim
+# Dockerfile
+# Cloud Runにデプロイするためのコンテナイメージを定義
 
-# Set working directory
+# ベースイメージとして公式のPythonイメージを使用
+FROM python:3.11-slim
+
+# 環境変数 PORT を設定。Cloud Runはこのポートにリクエストを送信する
+ENV PORT 8080
+# Pythonの出力をバッファリングしないように設定
+ENV PYTHONUNBUFFERED TRUE
+
+# アプリケーションの作業ディレクトリを作成
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+# 依存関係ファイルをコピー
+COPY requirements.txt .
 
-# Copy requirements
-COPY pyproject.toml uv.lock ./
+# pipをアップグレードし、依存関係をインストール
+RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install uv for fast dependency management
-RUN pip install uv
-
-# Install dependencies
-RUN uv pip install --system --no-cache -r pyproject.toml
-
-# Copy application code
+# アプリケーションのソースコードをコピー
 COPY . .
 
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash app \
-    && chown -R app:app /app
-USER app
-
-# Create directories for storage
-RUN mkdir -p /tmp/recordings
-
-# Expose port
-EXPOSE 8080
-
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
-
-# Run the application
-CMD ["python", "main.py"]
+# コンテナ起動時にuvicornサーバーを実行するコマンド
+# 0.0.0.0 にバインドして、コンテナ外部からのリクエストを受け付ける
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
