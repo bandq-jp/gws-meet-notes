@@ -6,6 +6,8 @@ import os
 import uuid
 import json
 import logging
+import time
+from datetime import datetime
 from typing import Dict, Any, Optional, Union, Tuple
 
 from fastapi import FastAPI, Request, Response, HTTPException
@@ -61,24 +63,45 @@ app = FastAPI(
 def _get_credentials_from_secret_manager(secret_name: str, subject_email: str) -> service_account.Credentials:
     """Secret Managerからサービスアカウントキーを安全に取得"""
     try:
+        # Application Default Credentialsを使用してSecret Managerクライアントを作成
         client = secretmanager.SecretManagerServiceClient()
+        
+        # 正しいSecret名フォーマットを使用（パス形式ではなくシークレット名のみ）
         name = f"projects/{GCP_PROJECT_ID}/secrets/{secret_name}/versions/latest"
         
-        logger.info(f"Fetching credentials from Secret Manager: {secret_name}")
+        logger.info(f"Accessing Secret Manager: {secret_name}")
         response = client.access_secret_version(request={"name": name})
         
         key_data = response.payload.data.decode("UTF-8")
-        key_info = json.loads(key_data)
+        logger.info("Successfully retrieved secret from Secret Manager")
         
+        # JSONデータの解析
+        try:
+            key_info = json.loads(key_data)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON format in secret: {str(e)[:50]}...")
+            raise ValueError("Secret contains invalid JSON data")
+        
+        # 必要なフィールドの確認
+        required_fields = ['type', 'project_id', 'private_key_id', 'private_key', 'client_email', 'client_id']
+        missing_fields = [field for field in required_fields if field not in key_info]
+        if missing_fields:
+            raise ValueError(f"Secret missing required fields: {missing_fields}")
+        
+        # サービスアカウント認証情報を作成
         credentials = service_account.Credentials.from_service_account_info(
             key_info, scopes=SCOPES
         )
         
-        logger.info("Successfully loaded service account from Secret Manager")
-        return credentials.with_subject(subject_email)
+        # ドメイン全体の委任（domain-wide delegation）を設定
+        delegated_credentials = credentials.with_subject(subject_email)
+        
+        logger.info(f"Successfully created delegated credentials for: {subject_email}")
+        return delegated_credentials
         
     except Exception as e:
-        logger.error(f"Failed to load from Secret Manager: {str(e)[:100]}...")
+        logger.error(f"Secret Manager authentication failed: {str(e)[:100]}...")
+        # 機密情報がログに出力されないよう注意
         raise
 
 def _get_credentials_from_file(file_path: str, subject_email: str) -> service_account.Credentials:
@@ -102,28 +125,120 @@ def get_impersonated_credentials(subject_email: str) -> Union[service_account.Cr
     """
     優先順位に基づいた認証情報取得
     1. Secret Manager（推奨）
-    2. サービスアカウントファイル（開発用）
+    2. サービスアカウントファイル（開発用） 
     3. デフォルト認証（制限あり）
     """
     logger.info(f"Getting credentials for user: {subject_email}")
     
+    # 基本設定の検証
+    if not GCP_PROJECT_ID:
+        raise ValueError("GCP_PROJECT_ID environment variable is required")
+    
+    if not subject_email or '@' not in subject_email:
+        raise ValueError(f"Invalid subject email: {subject_email}")
+    
     # 方法1: Secret Manager（推奨）
-    if SERVICE_ACCOUNT_SECRET_NAME and GCP_PROJECT_ID:
+    if SERVICE_ACCOUNT_SECRET_NAME:
         try:
+            logger.info(f"Attempting Secret Manager authentication for: {subject_email}")
             return _get_credentials_from_secret_manager(SERVICE_ACCOUNT_SECRET_NAME, subject_email)
         except Exception as e:
             logger.error(f"Secret Manager authentication failed: {str(e)[:100]}...")
+            # Secret Managerが設定されている場合は他の方法を試さない（セキュリティ上の理由）
+            raise
     
-    # 方法2: サービスアカウントファイル（開発用）
+    # 方法2: サービスアカウントファイル（開発用のみ）
     if SERVICE_ACCOUNT_FILE_PATH:
         try:
+            logger.info(f"Attempting file-based authentication for: {subject_email}")
             return _get_credentials_from_file(SERVICE_ACCOUNT_FILE_PATH, subject_email)
         except Exception as e:
             logger.error(f"File-based authentication failed: {str(e)[:100]}...")
+            raise
     
     # 方法3: デフォルト認証（制限あり）
-    logger.warning("Falling back to default credentials - limited functionality")
+    logger.warning("No service account configured - using default credentials")
+    logger.warning("Domain delegation will not be available with default credentials")
     return _get_default_credentials_with_impersonation(subject_email)
+
+# --- Google Drive フォルダ検索機能 -------------------------------------------
+
+def _find_meet_recordings_folder(drive_service, user_email: str) -> Optional[str]:
+    """
+    Meet Recordingsフォルダを検索（多言語対応）
+    Google Meetは地域設定により異なる名前でフォルダを作成する可能性がある
+    """
+    try:
+        # 可能な フォルダ名のリスト（英語、日本語、その他の地域設定）
+        possible_names = [
+            'Meet Recordings',
+            'Meet 記録',
+            'Meet録画',
+            'Google Meet録画',
+            'Google Meet 記録',
+            'ミート記録',
+            'ミート録画'
+        ]
+        
+        logger.info(f"Searching for Meet Recordings folder for user: {user_email}")
+        
+        # 各可能な名前で検索
+        for folder_name in possible_names:
+            query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'"
+            try:
+                response = drive_service.files().list(
+                    q=query, 
+                    fields='files(id, name)',
+                    pageSize=10
+                ).execute()
+                
+                files = response.get('files', [])
+                if files:
+                    folder_id = files[0]['id']
+                    folder_name = files[0]['name']
+                    logger.info(f"Found folder '{folder_name}' with ID: {folder_id}")
+                    return folder_id
+                    
+            except Exception as e:
+                logger.warning(f"Error searching for folder '{folder_name}': {str(e)[:50]}...")
+                continue
+        
+        # フォルダが見つからない場合、より広範囲の検索を実行
+        logger.info("Attempting broader search for recording folders...")
+        
+        # "Meet" または "記録" を含むフォルダを検索
+        broad_queries = [
+            "name contains 'Meet' and mimeType='application/vnd.google-apps.folder'",
+            "name contains '記録' and mimeType='application/vnd.google-apps.folder'",
+            "name contains 'Recording' and mimeType='application/vnd.google-apps.folder'"
+        ]
+        
+        for query in broad_queries:
+            try:
+                response = drive_service.files().list(
+                    q=query,
+                    fields='files(id, name)',
+                    pageSize=20
+                ).execute()
+                
+                files = response.get('files', [])
+                for file_info in files:
+                    folder_name = file_info['name'].lower()
+                    # より柔軟なマッチング
+                    if any(keyword in folder_name for keyword in ['meet', 'recording', '記録', '録画']):
+                        logger.info(f"Found potential Meet folder: '{file_info['name']}' ID: {file_info['id']}")
+                        return file_info['id']
+                        
+            except Exception as e:
+                logger.warning(f"Error in broad search: {str(e)[:50]}...")
+                continue
+        
+        logger.error(f"No Meet Recordings folder found for user: {user_email}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Failed to search for Meet Recordings folder: {str(e)[:100]}...")
+        return None
 
 # --- セキュアなWebhook処理 ---------------------------------------------------
 
@@ -199,32 +314,50 @@ async def health_check():
 
 @app.post("/test-authentication")
 async def test_authentication():
-    """認証システムのテスト"""
+    """認証システムの包括的テスト"""
     if not monitored_users:
         raise HTTPException(status_code=400, detail="No monitored users configured")
     
     results = []
     for user_email in monitored_users.keys():
         try:
+            logger.info(f"Testing authentication for: {user_email}")
             creds = get_impersonated_credentials(user_email)
             drive_service = build('drive', 'v3', credentials=creds)
             
-            # 簡単なAPI呼び出しでテスト
-            about = drive_service.about().get(fields='user').execute()
+            # 基本的な認証テスト
+            about = drive_service.about().get(fields='user,storageQuota').execute()
             user_info = about.get('user', {})
+            
+            # 権限テスト - ファイル一覧取得
+            files_response = drive_service.files().list(
+                pageSize=5,
+                fields='files(id, name, mimeType)'
+            ).execute()
+            
+            files_count = len(files_response.get('files', []))
             
             results.append({
                 "user": user_email,
                 "status": "success",
-                "authenticated_as": user_info.get('emailAddress', 'unknown')
+                "authenticated_as": user_info.get('emailAddress', 'unknown'),
+                "display_name": user_info.get('displayName', 'Unknown'),
+                "domain_delegation": user_info.get('emailAddress') == user_email,
+                "files_accessible": files_count,
+                "credentials_type": type(creds).__name__
             })
             
+            logger.info(f"Authentication successful for {user_email}")
+            
         except Exception as e:
+            error_message = str(e)[:200]
             results.append({
                 "user": user_email,
                 "status": "error",
-                "error": str(e)[:100]
+                "error": error_message,
+                "error_type": type(e).__name__
             })
+            logger.error(f"Authentication failed for {user_email}: {error_message}")
     
     return {"authentication_test": results}
 
@@ -256,38 +389,14 @@ async def handle_drive_notification(request: Request):
             logger.warning(f"Unknown user: {user_email}")
             return Response(status_code=204)
         
+        logger.info(f"Processing webhook for user: {user_email}, folder: {folder_id}")
+        
         # 認証取得
         creds = get_impersonated_credentials(user_email)
         drive_service = build('drive', 'v3', credentials=creds)
         
-        # 変更をチェック
-        response = drive_service.changes().getStartPageToken().execute()
-        start_page_token = response.get('startPageToken')
-        
-        try:
-            changes_response = drive_service.changes().list(
-                pageToken=start_page_token,
-                includeRemoved=False,
-                spaces='drive',
-                fields='changes(file(id,name,mimeType,parents))'
-            ).execute()
-            
-            # Meet Recordingsフォルダ内のGoogleドキュメントをチェック
-            for change in changes_response.get('changes', []):
-                file_info = change.get('file')
-                if not file_info:
-                    continue
-                
-                if (file_info.get('mimeType') == 'application/vnd.google-apps.document' and
-                    folder_id in file_info.get('parents', [])):
-                    
-                    logger.info(f"Found new document: {file_info.get('name')}")
-                    await _process_document_safely(file_info.get('id'), user_email)
-        
-        except Exception as changes_error:
-            logger.error(f"Changes API error: {changes_error}")
-            # フォールバック: フォルダ直接チェック
-            await _check_folder_directly(folder_id, user_email)
+        # 変更チェックの改善版実装
+        await _process_drive_changes(drive_service, folder_id, user_email)
     
     except Exception as e:
         logger.error(f"Webhook processing error: {str(e)[:100]}...")
@@ -299,23 +408,87 @@ async def handle_drive_notification(request: Request):
     
     return Response(status_code=204)
 
+async def _process_drive_changes(drive_service, folder_id: str, user_email: str) -> None:
+    """
+    Google Driveの変更を処理する改善版
+    """
+    try:
+        # 現在のページトークンを取得
+        response = drive_service.changes().getStartPageToken().execute()
+        start_page_token = response.get('startPageToken')
+        
+        logger.info(f"Checking changes from page token: {start_page_token}")
+        
+        try:
+            # 変更リストを取得
+            changes_response = drive_service.changes().list(
+                pageToken=start_page_token,
+                includeRemoved=False,
+                spaces='drive',
+                fields='changes(file(id,name,mimeType,parents,createdTime))'
+            ).execute()
+            
+            changes = changes_response.get('changes', [])
+            logger.info(f"Found {len(changes)} changes to process")
+            
+            # Meet Recordingsフォルダ内の新しいドキュメントをチェック
+            for change in changes:
+                file_info = change.get('file')
+                if not file_info:
+                    continue
+                
+                file_name = file_info.get('name', 'Unknown')
+                file_type = file_info.get('mimeType', 'Unknown')
+                parents = file_info.get('parents', [])
+                
+                # 目的のフォルダ内のGoogle Documentsをチェック
+                if (file_type == 'application/vnd.google-apps.document' and folder_id in parents):
+                    logger.info(f"Found new Meet document: '{file_name}' in folder {folder_id}")
+                    await _process_document_safely(file_info.get('id'), user_email)
+                
+                # デバッグ情報
+                elif folder_id in parents:
+                    logger.info(f"Found other file in Meet folder: '{file_name}' (Type: {file_type})")
+        
+        except Exception as changes_error:
+            logger.error(f"Changes API error: {changes_error}")
+            # フォールバック: フォルダ直接チェック
+            logger.info("Falling back to direct folder check...")
+            await _check_folder_directly(folder_id, user_email)
+    
+    except Exception as e:
+        logger.error(f"Drive changes processing failed: {str(e)[:100]}...")
+        # フォールバック処理
+        await _check_folder_directly(folder_id, user_email)
+
 async def _check_folder_directly(folder_id: str, user_email: str) -> None:
     """フォルダの直接チェック（フォールバック）"""
     try:
         creds = get_impersonated_credentials(user_email)
         drive_service = build('drive', 'v3', credentials=creds)
         
-        query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.document'"
+        # Google Documentsとその他のMeet関連ファイルを検索
+        query = f"'{folder_id}' in parents and (mimeType='application/vnd.google-apps.document' or name contains '.docx' or name contains 'transcript')"
         response = drive_service.files().list(
             q=query,
             orderBy='createdTime desc',
-            pageSize=5,
-            fields='files(id, name, createdTime)'
+            pageSize=10,
+            fields='files(id, name, createdTime, mimeType)'
         ).execute()
         
-        for file_info in response.get('files', []):
-            logger.info(f"Direct check found document: {file_info.get('name')}")
-            await _process_document_safely(file_info.get('id'), user_email)
+        files = response.get('files', [])
+        logger.info(f"Direct check found {len(files)} potential files in folder {folder_id}")
+        
+        for file_info in files:
+            file_name = file_info.get('name', 'Unknown')
+            file_type = file_info.get('mimeType', 'Unknown')
+            logger.info(f"Processing file: '{file_name}' (Type: {file_type})")
+            
+            # Google Documentsのみ処理（他のファイルタイプは将来的に拡張可能）
+            if file_type == 'application/vnd.google-apps.document':
+                await _process_document_safely(file_info.get('id'), user_email)
+            else:
+                logger.info(f"Skipping non-document file: {file_name}")
             
     except Exception as e:
         logger.error(f"Direct folder check failed: {str(e)[:100]}...")
@@ -334,25 +507,21 @@ async def test_folder_check():
             
             # フォルダIDが設定されていない場合は検索
             if not folder_id:
-                q = "name='Meet Recordings' and mimeType='application/vnd.google-apps.folder'"
-                response = drive_service.files().list(q=q, fields='files(id, name)').execute()
-                files = response.get('files', [])
-                
-                if files:
-                    folder_id = files[0]['id']
-                    results.append({
-                        "user": user_email,
-                        "status": "found_folder",
-                        "folder_id": folder_id,
-                        "folder_name": files[0]['name']
-                    })
-                else:
+                folder_id = _find_meet_recordings_folder(drive_service, user_email)
+                if not folder_id:
                     results.append({
                         "user": user_email,
                         "status": "folder_not_found",
                         "error": "Meet Recordings folder not found"
                     })
                     continue
+                
+                results.append({
+                    "user": user_email,
+                    "status": "found_folder",
+                    "folder_id": folder_id,
+                    "folder_name": "Meet Recordings"
+                })
             
             # フォルダ内のドキュメントをチェック
             query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.document'"
@@ -401,39 +570,49 @@ async def renew_all_watches():
             
             # フォルダID確認・取得
             if not folder_id:
-                q = "name='Meet Recordings' and mimeType='application/vnd.google-apps.folder'"
-                response = drive_service.files().list(q=q, fields='files(id, name)').execute()
-                files = response.get('files', [])
-                
-                if not files:
+                folder_id = _find_meet_recordings_folder(drive_service, user_email)
+                if not folder_id:
                     raise FileNotFoundError("Meet Recordings folder not found")
                 
-                folder_id = files[0]['id']
                 logger.info(f"Found Meet Recordings folder: {folder_id}")
             
             # changes.watch設定
             page_token_response = drive_service.changes().getStartPageToken().execute()
             start_page_token = page_token_response.get('startPageToken')
             
+            # ユニークなチャネルIDを生成
             channel_id = str(uuid.uuid4())
+            
+            # Watchリクエストの設定
             watch_request = {
                 "id": channel_id,
                 "type": "web_hook",
                 "address": WEBHOOK_URL,
-                "token": f"{user_email}:{folder_id}"
+                "token": f"{user_email}:{folder_id}",
+                "expiration": str(int((time.time() + 86400) * 1000))  # 24時間後に期限切れ
             }
             
+            # Watchチャネルを設定
             watch_response = drive_service.changes().watch(
                 pageToken=start_page_token,
                 body=watch_request
             ).execute()
+            
+            expiration_time = watch_response.get('expiration')
+            if expiration_time:
+                # ミリ秒から秒に変換
+                expiration_datetime = datetime.fromtimestamp(int(expiration_time) / 1000)
+                expiration_str = expiration_datetime.isoformat()
+            else:
+                expiration_str = "Unknown"
             
             results.append({
                 "user": user_email,
                 "status": "success",
                 "channel_id": channel_id,
                 "folder_id": folder_id,
-                "expiration": watch_response.get('expiration')
+                "expiration": expiration_str,
+                "webhook_url": WEBHOOK_URL
             })
             
             logger.info(f"Successfully set up watch for {user_email}")
@@ -463,7 +642,7 @@ async def root():
     """アプリケーション情報"""
     return {
         "name": "Google Meet Minutes Processor",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "running",
         "endpoints": {
             "health": "/health",
@@ -472,7 +651,13 @@ async def root():
             "test_folder": "/test-folder-check",
             "renew_watches": "/renew-all-watches"
         },
-        "monitored_users": len(monitored_users)
+        "monitored_users": len(monitored_users),
+        "configuration": {
+            "secret_manager_enabled": bool(SERVICE_ACCOUNT_SECRET_NAME),
+            "file_auth_enabled": bool(SERVICE_ACCOUNT_FILE_PATH),
+            "project_id": bool(GCP_PROJECT_ID),
+            "webhook_url": bool(WEBHOOK_URL)
+        }
     }
 
 if __name__ == "__main__":
